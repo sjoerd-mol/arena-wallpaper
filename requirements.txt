@@ -1,0 +1,3 @@
+Pillow
+python-dotenv
+pyobjc-framework-Cocoa

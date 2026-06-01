@@ -1,0 +1,4 @@
+# Run this from the project root to trigger a manual sync and wallpaper update,
+# then tail the last 5 lines of the log to confirm it ran cleanly.
+
+.venv/bin/python arena_wallpaper.py && tail -n 5 arena_wallpaper.log

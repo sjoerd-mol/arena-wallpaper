@@ -1,0 +1,22 @@
+# Credentials and local config
+.env
+
+# Images — not committed, downloaded at runtime
+images/
+images-iphone/
+.cache/
+
+# Runtime state
+.state.json
+*.log
+
+# Python
+.venv/
+__pycache__/
+
+# Machine-specific LaunchAgent (use launchagent.plist.template instead)
+*.plist
+
+# macOS
+.DS_Store
+.claude/
