@@ -164,4 +164,6 @@ To regenerate all iPhone wallpapers from the current image pool (useful after ch
 
 ## Credits
 
-Built by [Sjoerd Mol](https://github.com/sjoerd-mol). Uses [Are.na](https://www.are.na) as the image source and curation layer.
+Built by [Sjoerd Mol](https://github.com/sjoerd-mol).
+Uses [Are.na](https://www.are.na) as the image source and curation layer.
+Built with assistance from Claude (Anthropic).
