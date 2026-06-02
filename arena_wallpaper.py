@@ -23,7 +23,8 @@ def load_config():
     load_dotenv(ENV_PATH)
     token = os.getenv("ARENA_ACCESS_TOKEN", "").strip()
     slug = os.getenv("ARENA_BOARD_SLUG", "").strip()
-    image_dir = Path(os.getenv("IMAGE_DIR", str(IMG_DIR)))
+    image_dir_env = os.getenv("IMAGE_DIR", "").strip()
+    image_dir = Path(image_dir_env) if image_dir_env else IMG_DIR
     scale = os.getenv("WALLPAPER_SCALE", "center").strip()
     per_screen_random = os.getenv("PER_SCREEN_RANDOM", "true").lower() == "true"
     target_w = int(os.getenv("TARGET_WIDTH", "480") or "0")
@@ -121,8 +122,39 @@ def download_image(url: str, dest: Path) -> bool:
     subprocess.check_call(cmd)
     return True
 
+def normalize_image(path: Path) -> Path:
+    """Convert WebP to PNG and extract first frame from GIF.
+
+    Are.na serves various image formats. WebP and GIF require normalization:
+    - WebP: not universally supported as a wallpaper source; converted to PNG.
+    - GIF: only the first frame is used (animated GIFs are not useful as wallpapers).
+
+    All other formats (JPEG, PNG, TIFF, etc.) are left untouched.
+    Returns the final path, which may differ from the input if conversion occurred.
+    """
+    try:
+        with Image.open(path) as im:
+            fmt = im.format
+            if fmt == "GIF":
+                im.seek(0)
+                out = path.with_suffix(".png")
+                im.convert("RGBA").convert("RGB").save(out, "PNG")
+                path.unlink()
+                log(f"GIF converted to PNG (first frame): {out.name}")
+                return out
+            elif fmt == "WEBP":
+                out = path.with_suffix(".png")
+                im.convert("RGB").save(out, "PNG")
+                path.unlink()
+                log(f"WebP converted to PNG: {out.name}")
+                return out
+    except Exception as e:
+        log(f"Normalize failed for {path.name}: {e}")
+    return path
+
 def list_local_images(image_dir: Path) -> List[Path]:
-    return sorted([p for p in image_dir.glob("*") if p.suffix.lower() in (".jpg",".jpeg",".png",".heic",".tiff",".gif",".bmp")])
+    exts = {".jpg", ".jpeg", ".png", ".heic", ".tiff", ".gif", ".bmp", ".webp"}
+    return sorted([p for p in image_dir.glob("*") if p.suffix.lower() in exts])
 
 # Prepare centered 480px-wide temp copy; original untouched
 def prepare_for_wallpaper(img: Path, target_w: int) -> Path:
@@ -136,13 +168,13 @@ def prepare_for_wallpaper(img: Path, target_w: int) -> Path:
     try:
         with Image.open(img) as im:
             w, h = im.size
-            if w == target_w:
-                im.save(outp)
+            if w <= target_w:  # never upscale
+                im.convert("RGB").save(outp)
                 return outp
-            ratio = target_w / float(w) if w else 1.0
-            th = max(1, int(round(h * ratio))) if h else target_w
+            ratio = target_w / float(w)
+            th = max(1, int(round(h * ratio)))
             im2 = im.resize((target_w, th), Image.LANCZOS)
-            im2.save(outp)
+            im2.convert("RGB").save(outp)
             return outp
     except Exception as e:
         log(f"Prep failed for {img.name}: {e}")
@@ -315,6 +347,7 @@ def sync_and_set():
         dest = cfg["image_dir"] / filename_from(bid, fname)
         try:
             download_image(url, dest)
+            dest = normalize_image(dest)
             seen.add(bid)
             new_count += 1
         except Exception as e:

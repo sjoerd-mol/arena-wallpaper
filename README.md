@@ -1,109 +1,168 @@
 # arena-wallpaper
 
-Pulls image blocks from an [Are.na](https://www.are.na) channel and uses them as rotating wallpapers on Mac and iPhone.
+A Python tool that pulls images from an [Are.na](https://www.are.na) channel and uses them as rotating wallpapers on your Mac and iPhone. Images are synced daily, with a different image set on each connected screen. On iPhone, pre-composed wallpapers are delivered silently via iCloud and set automatically through a Shortcuts automation.
 
-> **Apple ecosystem only.** This workflow is built around macOS LaunchAgents, pyobjc (macOS-native Python bindings), iCloud Drive, and iOS Shortcuts. It will not run on Windows or Linux in its current form.
+> **Apple ecosystem only.** This tool is built around macOS, iCloud Drive, and iOS Shortcuts. It does not run on Windows or Linux.
 
 ---
 
-## What it does
+## How it works
 
-Two output streams, one image pool:
+The script runs once a day via a background task (LaunchAgent). It does two things:
 
-- **Mac** — images are downloaded to `images/`, resized copies cached in `.cache/`. A LaunchAgent fires daily at 09:00, picks a different random image per connected screen, and sets them as wallpaper via the macOS API directly (no third-party CLI needed).
-- **iPhone** — each image is pre-composited onto a black canvas at the correct screen resolution and written to an iCloud Drive folder. An iOS Shortcut reads from that folder on a schedule and sets the wallpaper silently.
+1. **Syncs new images** from your Are.na channel to a local folder on your Mac.
+2. **Sets a random wallpaper** on each connected screen, picking a different image per screen and avoiding recent repeats.
 
-Low-resolution Are.na blocks appear smaller than full-width on the iPhone canvas by design — images display at their native scale rather than being stretched.
+At the same time, it generates iPhone-sized versions of every image and writes them to an iCloud Drive folder. An iOS Shortcut reads from that folder on a schedule and silently sets your iPhone wallpaper.
 
 ---
 
 ## Requirements
 
 - macOS 13 or later
-- Python 3.12 or later (Homebrew: `brew install python`)
-- An [Are.na](https://www.are.na) account with a channel of image blocks
-- iCloud Drive enabled (for the iPhone workflow)
-- iPhone with iOS Shortcuts (for the iPhone workflow)
+- Python 3.12 or later — install via Homebrew: `brew install python`
+- An [Are.na](https://www.are.na) account with at least one channel containing image blocks
+- iCloud Drive enabled on your Mac (for iPhone wallpapers)
+- iPhone with Shortcuts (for iPhone wallpapers)
 
 ---
 
-## Installation
+## Setup
 
-**1. Clone the repo**
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/sjoerd-mol/arena-wallpaper.git
+git clone https://github.com/sjoerdmol/arena-wallpaper.git
 cd arena-wallpaper
 ```
 
-**2. Create a virtual environment and install dependencies**
+### 2. Create a Python environment and install dependencies
 
 ```bash
-python3 -m venv .venv
+/opt/homebrew/bin/python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-**3. Configure**
+> If `brew install python` installed a different version, check what's available: `ls /opt/homebrew/bin/python*`
+
+### 3. Configure
+
+Copy the example config file and open it in a text editor:
 
 ```bash
 cp .env.example .env
+open -e .env
 ```
 
-Open `.env` and fill in:
+The two required values are:
 
-- `ARENA_ACCESS_TOKEN` — generate one at [are.na/settings/personal-access-tokens](https://www.are.na/settings/personal-access-tokens)
-- `ARENA_BOARD_SLUG` — the slug from your channel URL (`are.na/username/channel-slug`)
-- `IMAGE_DIR` — absolute path to where images should be stored (e.g. `/Users/you/Documents/arena-wallpaper/images`)
-- `IPHONE_IMAGE_DIR` — absolute path inside your iCloud Drive (see `.env.example` for the correct format)
+- **`ARENA_ACCESS_TOKEN`** — your Are.na personal access token. Generate one at [are.na/settings/personal-access-tokens](https://www.are.na/settings/personal-access-tokens).
+- **`ARENA_BOARD_SLUG`** — the slug of your Are.na channel, found in its URL: `are.na/username/this-part-here`.
 
-All other values have sensible defaults; see `.env.example` for documentation on each.
+Everything else has a working default. See `.env.example` for documentation on each setting.
 
-**4. Run manually to verify**
+**For iPhone wallpapers**, also set `IPHONE_IMAGE_DIR` to a folder inside your iCloud Drive. This is where the script will write iPhone-sized images so your iPhone can read them.
+
+The iCloud Drive path on your Mac looks like this:
+```
+/Users/YOUR_USERNAME/Library/Mobile Documents/com~apple~CloudDocs/
+```
+
+Create a folder anywhere inside iCloud Drive for the iPhone wallpapers, then paste its full path into `IPHONE_IMAGE_DIR`. The easiest way to copy a folder's path on Mac: **Option+right-click** the folder in Finder, then choose **Copy "..." as Pathname**.
+
+The script will create the folder automatically on first run if it does not exist yet.
+
+### 4. Run manually to verify
 
 ```bash
 .venv/bin/python arena_wallpaper.py && tail -n 5 arena_wallpaper.log
 ```
 
-The log should end with `Done.` and show which image was set on each screen.
+The last lines of the log should look like:
+
+```
+[2026-06-01 09:00:01] Sync complete. New images: 12
+[2026-06-01 09:00:04] Set screen 0 -> some_image.jpg
+[2026-06-01 09:00:04] Set screen 1 -> another_image.jpg
+[2026-06-01 09:00:04] Done.
+```
+
+If you see `Done.` your wallpaper has changed and the setup is working.
+
+### 5. Install the background task (LaunchAgent)
+
+The LaunchAgent runs the script automatically every day at 09:00. Run the install script once:
+
+```bash
+bash install_launchagent.sh
+```
+
+This script reads your username and project path automatically, generates the LaunchAgent config, installs it, and runs the script once immediately. The last lines of the log are printed so you can confirm it worked.
+
+You do not need to run this again. The LaunchAgent loads automatically on login from this point on.
 
 ---
 
-## Mac automation — LaunchAgent
+## iPhone setup
 
-The LaunchAgent runs the script daily at 09:00 without any user interaction.
+After running the script at least once, open your iCloud Drive folder (`IPHONE_IMAGE_DIR` from your `.env`) and confirm that images are there. These are the wallpapers your iPhone will use.
 
-**1. Create your plist from the template**
+Now set up the Shortcut that rotates them:
 
-```bash
-cp launchagent.plist.template com.YOUR_USERNAME.arena-wallpaper.plist
-```
+**In the Shortcuts app, go to Automation → + → New Automation → Personal Automation**
 
-Open the plist and replace every occurrence of:
-- `YOUR_USERNAME` — your macOS username (output of `whoami`)
-- `YOUR_PROJECT_PATH` — the absolute path to the cloned repo (output of `pwd`)
+Set the trigger to **Time of Day**. Choose a time (e.g. 09:00). You will repeat this for as many rotation points as you want throughout the day — iOS does not support hourly repeating automations natively, so stacking multiple time triggers (e.g. every 2 hours) is the workaround. Disable **Ask Before Running** for each one.
 
-**2. Install and load**
+**Add these actions to the automation:**
 
-```bash
-cp com.YOUR_USERNAME.arena-wallpaper.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.YOUR_USERNAME.arena-wallpaper.plist
-```
+**Action 1 — Get Contents of Folder**
+Tap the folder field and navigate to your iCloud Drive → the folder you set as `IPHONE_IMAGE_DIR` (called `images-iphone` by default).
 
-**3. Trigger a manual run**
+**Action 2 — Get Random Item from List**
+The folder contents from action 1 are used automatically as the list. No extra configuration needed.
 
-```bash
-launchctl start com.YOUR_USERNAME.arena-wallpaper
-```
+**Action 3 — Set Wallpaper Photo**
+The random image from action 2 is used automatically as the input. Tap the expand arrow (↓) on this action to open its settings:
+- Set screen to **Lock Screen**
+- Turn off **Show Preview**
+- Turn off **Crop to Subject**
 
-**Network timing note:** if the LaunchAgent fires before macOS has established a network connection, the Are.na sync is skipped but the wallpaper still rotates from the local image pool. This is handled gracefully — no action needed.
+Save the automation. Repeat for each time trigger you want.
 
 ---
 
-## iPhone automation — iOS Shortcuts
+## Running manually
 
-The Python script writes pre-composited wallpapers to the iCloud folder you set as `IPHONE_IMAGE_DIR`. An iOS Shortcut reads from that folder and sets a random image as wallpaper.
+To trigger an immediate sync and wallpaper update from the project folder:
 
-**Canvas sizes by model:**
+```bash
+.venv/bin/python arena_wallpaper.py && tail -n 5 arena_wallpaper.log
+```
+
+Or use the shorthand saved in `refresh_command.txt`.
+
+To regenerate all iPhone wallpapers (useful after changing canvas size settings):
+
+```bash
+.venv/bin/python arena_wallpaper.py --batch-iphone
+```
+
+---
+
+## Configuration reference
+
+All settings live in `.env`. See `.env.example` for full descriptions. Key options:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `WALLPAPER_SCALE` | `center` | How the image is displayed. `center` = actual size, no scaling. Also: `fill`, `fit`, `stretch`. |
+| `TARGET_WIDTH` | `720` | Width in pixels of the cached copy used for display. Originals are never modified. Images narrower than this are never upscaled. |
+| `PER_SCREEN_RANDOM` | `true` | Pick a different image per connected screen. |
+| `RECENT_DAYS` | `7` | Number of days to avoid repeating the same image. |
+| `IPHONE_CANVAS_W` / `H` | `1206` / `2622` | iPhone screen resolution. Match to your model (see below). |
+| `IPHONE_IMAGE_SCALE` | `0.75` | Image width as a fraction of the canvas. Low-res images may appear smaller — this is intentional. |
+
+**iPhone canvas sizes by model:**
 
 | Model | Width | Height |
 |---|---|---|
@@ -112,53 +171,18 @@ The Python script writes pre-composited wallpapers to the iCloud folder you set 
 | iPhone 15 Pro | 1179 | 2556 |
 | iPhone 14 Pro | 1179 | 2556 |
 
-Set `IPHONE_CANVAS_W` and `IPHONE_CANVAS_H` in `.env` to match your model.
-
-**Shortcut setup (4 actions):**
-
-1. **Get Contents of Folder** — set path to your iCloud Drive `images-iphone` folder
-2. **Get Random Item from List** — input: output of step 1
-3. **Get File** — input: Random Item
-4. **Set Wallpaper Photo** — input: File, position: Centre, apply to both screens
-
-Set this as a Personal Automation on a time trigger. iOS does not support sub-daily repeat intervals natively — the simplest workaround is to create the same automation at multiple fixed times (e.g. 09:00, 11:00, 13:00, 15:00, 17:00, 19:00). Disable "Ask Before Running" on each so they fire silently.
-
 ---
 
-## Configuration reference
+## Troubleshooting
 
-See `.env.example` for all available options with descriptions.
+**Wallpaper did not change after install**
+Check the log: `tail -n 20 arena_wallpaper.log`. If you see `Sync complete. New images: 0` and no `Set screen` lines, the image folder may be empty. Run the script manually first to populate it.
 
-Key settings:
+**Are.na sync fails with a network error**
+The LaunchAgent sometimes fires before macOS has established a network connection. The script handles this gracefully — the sync is skipped but the wallpaper still rotates from the local image pool. This resolves itself on the next run.
 
-| Variable | Default | Notes |
-|---|---|---|
-| `WALLPAPER_SCALE` | `center` | `center` shows images at actual pixel size. Other options: `fill`, `fit`, `stretch` |
-| `TARGET_WIDTH` | `720` | Width in px for the display cache. Originals in `images/` are never modified. |
-| `PER_SCREEN_RANDOM` | `true` | Different image per screen when multiple displays are connected |
-| `RECENT_DAYS` | `7` | Avoids repeating images shown in the last N days |
-| `IPHONE_IMAGE_SCALE` | `0.75` | Image width as a fraction of the iPhone canvas. Low-res images may appear smaller. |
-
----
-
-## Wallpaper scale modes
-
-| Value | macOS label | Behaviour |
-|---|---|---|
-| `center` | Centre | Actual pixel size, no scaling |
-| `fill` | Fill Screen | Scale to fill, crop excess |
-| `fit` | Fit to Screen | Scale to fit, letterbox |
-| `stretch` | Stretch to Fill | Stretch to fill, ignores aspect ratio |
-
----
-
-## Running the iPhone batch manually
-
-To regenerate all iPhone wallpapers from the current image pool (useful after changing canvas settings):
-
-```bash
-.venv/bin/python arena_wallpaper.py --batch-iphone
-```
+**`python3` points to the wrong Python**
+Some tools (e.g. PlatformIO) add their own Python to the front of your PATH. Use the full Homebrew path explicitly: `/opt/homebrew/bin/python3`.
 
 ---
 
@@ -166,4 +190,4 @@ To regenerate all iPhone wallpapers from the current image pool (useful after ch
 
 Built by [Sjoerd Mol](https://github.com/sjoerd-mol).
 Uses [Are.na](https://www.are.na) as the image source and curation layer.
-Built with assistance from Claude (Anthropic).
+Built with assistance from [Claude](https://claude.ai) (Anthropic).
