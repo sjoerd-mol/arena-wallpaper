@@ -32,7 +32,7 @@ At the same time, it generates iPhone-sized versions of every image and writes t
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/sjoerdmol/arena-wallpaper.git
+git clone https://github.com/sjoerd-mol/arena-wallpaper.git
 cd arena-wallpaper
 ```
 
