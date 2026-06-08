@@ -256,8 +256,12 @@ def set_wallpaper_for_screen(img: Path, screen: str, scale: str):
         targets = [(idx, all_screens[idx])]
 
     for idx, ns_screen in targets:
+        # Preserve existing options (e.g. fill color) so user-set background color survives
+        current = workspace.desktopImageOptionsForScreen_(ns_screen)
+        merged = dict(current) if current else {}
+        merged.update(options)
         success, error = workspace.setDesktopImageURL_forScreen_options_error_(
-            url, ns_screen, options, None
+            url, ns_screen, merged, None
         )
         if success:
             log(f"Set screen {idx} -> {img.name}")
