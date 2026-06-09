@@ -21,3 +21,6 @@ __pycache__/
 # macOS
 .DS_Store
 .claude/
+
+# Local-only working notes (kept on disk, not published)
+CLAUDE.md
