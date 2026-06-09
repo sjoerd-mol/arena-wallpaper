@@ -106,6 +106,20 @@ This script reads your username and project path automatically, generates the La
 
 You do not need to run this again. The LaunchAgent loads automatically on login from this point on.
 
+### 6. (Optional) Notifications
+
+Notifications are **off by default** — if you don't configure them, nothing changes.
+To get pushed a high-priority alert when a run fails and a quiet once-a-day summary,
+set `NTFY_URL` in your `.env` to an [ntfy](https://ntfy.sh) topic (open source,
+self-hostable). Install the ntfy app, subscribe to the same topic, and:
+
+```
+NTFY_URL=https://ntfy.sh/your-long-unguessable-topic
+# NTFY_TOKEN=tk_...   # only for a protected/reserved topic
+```
+
+The topic/token live only in your gitignored `.env`, so this is safe in a shared repo.
+
 ---
 
 ## iPhone setup

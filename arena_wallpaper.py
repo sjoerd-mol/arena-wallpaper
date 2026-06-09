@@ -50,6 +50,8 @@ def load_config():
     iphone_canvas_w = int(os.getenv("IPHONE_CANVAS_W", "1206") or "1206")
     iphone_canvas_h = int(os.getenv("IPHONE_CANVAS_H", "2622") or "2622")
     iphone_image_scale = float(os.getenv("IPHONE_IMAGE_SCALE", "0.75") or "0.75")
+    ntfy_url = os.getenv("NTFY_URL", "").strip()
+    ntfy_token = os.getenv("NTFY_TOKEN", "").strip()
     problems = []
     if token in _PLACEHOLDERS:
         problems.append("ARENA_ACCESS_TOKEN is missing or still the .env.example placeholder")
@@ -65,6 +67,7 @@ def load_config():
         "target_w": target_w, "recent_days": recent_days,
         "iphone_image_dir": iphone_image_dir, "iphone_canvas_w": iphone_canvas_w,
         "iphone_canvas_h": iphone_canvas_h, "iphone_image_scale": iphone_image_scale,
+        "ntfy_url": ntfy_url, "ntfy_token": ntfy_token,
     }
 
 def ensure_dirs(*paths: Path):
@@ -107,6 +110,29 @@ def save_state(state: dict):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, STATE_PATH)
+
+def notify(cfg: dict, title: str, message: str, priority: str = "default", tags: str = ""):
+    """Send an ntfy push if NTFY_URL is configured; a no-op otherwise.
+
+    Uses curl (no extra dependency) and never raises — a notification failure must
+    not affect the wallpaper run.
+    """
+    url = cfg.get("ntfy_url")
+    if not url:
+        return
+    cmd = ["curl", "-sS", "--connect-timeout", "10", "--max-time", "30",
+           "-H", f"Title: {title}"]
+    if priority:
+        cmd += ["-H", f"Priority: {priority}"]
+    if tags:
+        cmd += ["-H", f"Tags: {tags}"]
+    if cfg.get("ntfy_token"):
+        cmd += ["-H", f"Authorization: Bearer {cfg['ntfy_token']}"]
+    cmd += ["-d", message, url]
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"ntfy notification failed: {e}")
 
 # --- Are.na via curl (avoids Cloudflare issues) ---
 def _curl_json_once(url: str, token: Optional[str]) -> dict:
@@ -328,9 +354,10 @@ def set_wallpaper_for_screen(img: Path, screen: str, scale: str):
         idx = int(screen)
         if idx >= len(all_screens):
             log(f"Screen {screen} not available ({len(all_screens)} screen(s) connected)")
-            return
+            return False
         targets = [(idx, all_screens[idx])]
 
+    ok = True
     for idx, ns_screen in targets:
         # Preserve existing options (e.g. fill color) so user-set background color survives
         current = workspace.desktopImageOptionsForScreen_(ns_screen)
@@ -343,6 +370,8 @@ def set_wallpaper_for_screen(img: Path, screen: str, scale: str):
             log(f"Set screen {idx} -> {img.name}")
         else:
             log(f"Failed to set screen {idx}: {error}")
+            ok = False
+    return ok
 
 def build_recent_sets(state: Dict[str, Any], recent_days: int) -> Dict[str, set]:
     recent_by_screen: Dict[str, set] = {}
@@ -381,7 +410,7 @@ def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: 
 
     if not images:
         log("No images available to set.")
-        return
+        return 0, 0
 
     # Shuffle the list to start fresh
     shuffled = images.copy()
@@ -389,6 +418,7 @@ def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: 
 
     used_this_run = set()
     total = len(shuffled)
+    set_ok = set_fail = 0
 
     for i, screen in enumerate(screens):
         excluded = recent.get(screen, set()) | used_this_run
@@ -399,11 +429,15 @@ def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: 
             pick = random.choice(shuffled)
 
         prepared = prepare_for_wallpaper(pick, target_w)
-        set_wallpaper_for_screen(prepared, screen, scale)
+        if set_wallpaper_for_screen(prepared, screen, scale):
+            set_ok += 1
+        else:
+            set_fail += 1
         record_history(state, screen, pick.name)
         used_this_run.add(pick.name)
         log(f"Selected for screen {screen}: {pick.name} "
             f"(avoiding {len(excluded)} recent, {len(used_this_run)} used this run)")
+    return set_ok, set_fail
 
 
 def sync_and_set():
@@ -422,6 +456,8 @@ def sync_and_set():
     current_ids: set = set()
     total_blocks = image_blocks = 0
     sync_ok = False
+    warnings: list = []   # soft issues — reported quietly in the daily summary
+    errors: list = []     # hard failures — trigger a high-priority alert
 
     # Download ALL images. A network failure at boot (the LaunchAgent can fire before
     # the network is up) must not stop the wallpaper rotating off existing local images.
@@ -452,8 +488,10 @@ def sync_and_set():
                 dest.unlink(missing_ok=True)
         sync_ok = True
         if total_blocks and image_blocks == 0:
-            log(f"Warning: channel returned {total_blocks} blocks but 0 image blocks — "
-                f"Are.na may have changed its API shape (expected type == 'Image').")
+            msg = (f"channel returned {total_blocks} blocks but 0 image blocks — "
+                   f"Are.na may have changed its API shape (expected type == 'Image').")
+            log(f"Warning: {msg}")
+            warnings.append(msg)
         # Forget ids no longer present on the channel.
         if current_ids:
             seen &= current_ids
@@ -462,6 +500,7 @@ def sync_and_set():
         log(f"Sync complete. New images: {new_count}")
     except Exception as e:
         log(f"Are.na sync skipped ({e}); using existing local images.")
+        warnings.append(f"Are.na sync skipped ({type(e).__name__}); used existing images.")
 
     # Prune local files for blocks removed from the channel — only after a clean,
     # complete sync that actually returned images, so a transient empty response can
@@ -488,17 +527,40 @@ def sync_and_set():
 
     # Set wallpapers with no-repeat
     imgs = list_local_images(cfg["image_dir"])
-    if cfg["per_screen_random"]:
-        set_random_per_screen(imgs, cfg["scale"], cfg["target_w"], state, cfg["recent_days"])
+    set_ok = set_fail = 0
+    if not imgs:
+        errors.append("No local images available to set as wallpaper.")
+    elif cfg["per_screen_random"]:
+        set_ok, set_fail = set_random_per_screen(imgs, cfg["scale"], cfg["target_w"], state, cfg["recent_days"])
     else:
-        if imgs:
-            picked = choose_nonrecent(imgs, set())
-            prepared = prepare_for_wallpaper(picked, cfg["target_w"])
-            set_wallpaper_for_screen(prepared, "all", cfg["scale"])
-            record_history(state, "all", picked.name)
-            log(f"Selected for all screens: {picked.name}")
+        picked = choose_nonrecent(imgs, set())
+        prepared = prepare_for_wallpaper(picked, cfg["target_w"])
+        if set_wallpaper_for_screen(prepared, "all", cfg["scale"]):
+            set_ok = 1
+        else:
+            set_fail = 1
+        record_history(state, "all", picked.name)
+        log(f"Selected for all screens: {picked.name}")
+    if set_fail:
+        errors.append(f"{set_fail} screen(s) failed to set wallpaper.")
     save_state(state)
     log("Done.")
+
+    # --- ntfy notifications (no-op unless NTFY_URL is set in .env) ---
+    # Hard failures alert immediately; a clean run sends one quiet summary per day
+    # (so the extra RunAtLoad runs on login don't spam you).
+    if errors:
+        body = "\n".join(errors + warnings) + f"\n(new images: {new_count}, screens set: {set_ok})"
+        notify(cfg, "arena-wallpaper: problem", body, priority="high", tags="warning")
+    else:
+        today = today_str()
+        if state.get("last_summary_date") != today:
+            summary = f"Wallpaper updated on {set_ok} screen(s), {new_count} new image(s)."
+            if warnings:
+                summary += "\n" + "\n".join(warnings)
+            notify(cfg, "arena-wallpaper: daily summary", summary, priority="low", tags="frame_photo")
+            state["last_summary_date"] = today
+            save_state(state)
 
 if __name__ == "__main__":
     args = sys.argv[1:]
