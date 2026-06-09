@@ -63,14 +63,19 @@ Everything else has a working default. See `.env.example` for documentation on e
 
 **For iPhone wallpapers**, also set `IPHONE_IMAGE_DIR` to a folder inside your iCloud Drive. This is where the script will write iPhone-sized images so your iPhone can read them.
 
-The iCloud Drive path on your Mac looks like this:
+The iCloud Drive path on your Mac looks like this (`~` is expanded automatically, so you
+don't need to type your username):
 ```
-/Users/YOUR_USERNAME/Library/Mobile Documents/com~apple~CloudDocs/
+~/Library/Mobile Documents/com~apple~CloudDocs/
 ```
 
-Create a folder anywhere inside iCloud Drive for the iPhone wallpapers, then paste its full path into `IPHONE_IMAGE_DIR`. The easiest way to copy a folder's path on Mac: **Option+right-click** the folder in Finder, then choose **Copy "..." as Pathname**.
+The default in `.env.example` (`~/Library/Mobile Documents/com~apple~CloudDocs/sandbox/arena-wallpaper/images-iphone`)
+works as-is. To use a different folder, set `IPHONE_IMAGE_DIR` to any path inside iCloud
+Drive — `~/...` is fine. The script creates the folder on first run if it doesn't exist.
 
-The script will create the folder automatically on first run if it does not exist yet.
+If `IPHONE_IMAGE_DIR` is left as the placeholder or points somewhere uncreatable, the
+iPhone feature is skipped with a clear log line and the **Mac wallpaper still updates** —
+a misconfigured iPhone path can no longer break the daily run.
 
 ### 4. Run manually to verify
 

@@ -14,27 +14,43 @@ LOG_PATH = ROOT / "arena_wallpaper.log"
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 
+def _expand(p: str) -> str:
+    """Expand ~ and $VARS in a user-supplied path string."""
+    return os.path.expanduser(os.path.expandvars(p))
+
+
 def log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with LOG_PATH.open("a") as f:
         f.write(f"[{ts}] {msg}\n")
+
+# Values copied verbatim from .env.example — treated as "not configured".
+_PLACEHOLDERS = {"", "your_personal_access_token_here", "your-channel-slug"}
+
 
 def load_config():
     load_dotenv(ENV_PATH)
     token = os.getenv("ARENA_ACCESS_TOKEN", "").strip()
     slug = os.getenv("ARENA_BOARD_SLUG", "").strip()
     image_dir_env = os.getenv("IMAGE_DIR", "").strip()
-    image_dir = Path(image_dir_env) if image_dir_env else IMG_DIR
+    image_dir = Path(_expand(image_dir_env)) if image_dir_env else IMG_DIR
     scale = os.getenv("WALLPAPER_SCALE", "center").strip()
     per_screen_random = os.getenv("PER_SCREEN_RANDOM", "true").lower() == "true"
     target_w = int(os.getenv("TARGET_WIDTH", "480") or "0")
     recent_days = int(os.getenv("RECENT_DAYS", "7") or "0")
-    iphone_image_dir = Path(os.getenv("IPHONE_IMAGE_DIR", str(ROOT / "images-iphone")))
+    iphone_dir_env = os.getenv("IPHONE_IMAGE_DIR", "").strip()
+    iphone_image_dir = Path(_expand(iphone_dir_env)) if iphone_dir_env else (ROOT / "images-iphone")
     iphone_canvas_w = int(os.getenv("IPHONE_CANVAS_W", "1206") or "1206")
     iphone_canvas_h = int(os.getenv("IPHONE_CANVAS_H", "2622") or "2622")
     iphone_image_scale = float(os.getenv("IPHONE_IMAGE_SCALE", "0.75") or "0.75")
-    if not token or not slug:
-        print("Missing ARENA_ACCESS_TOKEN or ARENA_BOARD_SLUG in .env", file=sys.stderr)
+    problems = []
+    if token in _PLACEHOLDERS:
+        problems.append("ARENA_ACCESS_TOKEN is missing or still the .env.example placeholder")
+    if slug in _PLACEHOLDERS:
+        problems.append("ARENA_BOARD_SLUG is missing or still the .env.example placeholder")
+    if problems:
+        print("Config error in .env:\n  - " + "\n  - ".join(problems) +
+              "\nEdit .env and set real values (see .env.example).", file=sys.stderr)
         sys.exit(2)
     return {
         "token": token, "slug": slug, "image_dir": image_dir,
@@ -47,6 +63,22 @@ def load_config():
 def ensure_dirs(*paths: Path):
     for p in paths:
         p.mkdir(parents=True, exist_ok=True)
+
+def iphone_dir_usable(path: Path) -> Optional[str]:
+    """Return an error message if the iPhone (iCloud) output dir can't be used, else None.
+
+    The iPhone feature is optional: a misconfigured path must never crash the run and
+    stop the Mac wallpaper from updating. Catches the common 'unsubstituted placeholder'
+    mistake explicitly so the log says exactly what to fix.
+    """
+    if "YOUR_USERNAME" in str(path):
+        return ("IPHONE_IMAGE_DIR still contains the placeholder YOUR_USERNAME — "
+                "edit .env and set your real iCloud path.")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"cannot create IPHONE_IMAGE_DIR ({path}): {e}"
+    return None
 
 def today_str():
     return datetime.date.today().isoformat()
@@ -332,43 +364,57 @@ def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: 
 
 def sync_and_set():
     cfg = load_config()
-    ensure_dirs(cfg["image_dir"], cfg["iphone_image_dir"], CACHE_DIR)
+    # Only the local dirs are essential. The iPhone (iCloud) dir is optional and must
+    # never be able to break Mac wallpaper rotation, so it's validated separately.
+    ensure_dirs(cfg["image_dir"], CACHE_DIR)
+    iphone_error = iphone_dir_usable(cfg["iphone_image_dir"])
+    if iphone_error:
+        log(f"iPhone wallpapers disabled: {iphone_error}")
+    iphone_enabled = iphone_error is None
+
     state = load_state()
     seen = set(state.get("downloaded_ids", []))
     new_count = 0
 
-    # Download ALL images
-    for block in arena_iter_blocks(cfg["token"], cfg["slug"]):
-        if not is_image_block(block):
-            continue
-        bid = block.get("id")
-        if not bid or bid in seen:
-            continue
-        chosen = pick_image_url(block)
-        if not chosen:
-            continue
-        url, fname = chosen
-        dest = cfg["image_dir"] / filename_from(bid, fname)
+    # Download ALL images. A network failure at boot (the LaunchAgent can fire before
+    # the network is up) must not stop the wallpaper rotating off existing local images.
+    try:
+        for block in arena_iter_blocks(cfg["token"], cfg["slug"]):
+            if not is_image_block(block):
+                continue
+            bid = block.get("id")
+            if not bid or bid in seen:
+                continue
+            chosen = pick_image_url(block)
+            if not chosen:
+                continue
+            url, fname = chosen
+            dest = cfg["image_dir"] / filename_from(bid, fname)
+            try:
+                download_image(url, dest)
+                dest = normalize_image(dest)
+                seen.add(bid)
+                new_count += 1
+            except Exception as e:
+                log(f"Download failed for block {bid}: {e}")
+                dest.unlink(missing_ok=True)
+        state["downloaded_ids"] = sorted(seen)
+        save_state(state)
+        log(f"Sync complete. New images: {new_count}")
+    except Exception as e:
+        log(f"Are.na sync skipped ({e}); using existing local images.")
+
+    # Generate iPhone wallpapers for any image not yet processed (optional feature).
+    if iphone_enabled:
         try:
-            download_image(url, dest)
-            dest = normalize_image(dest)
-            seen.add(bid)
-            new_count += 1
+            for img in list_local_images(cfg["image_dir"]):
+                iphone_out = cfg["iphone_image_dir"] / (img.stem + ".jpg")
+                if not iphone_out.exists():
+                    prepare_iphone_wallpaper(img, cfg["iphone_image_dir"],
+                                             cfg["iphone_canvas_w"], cfg["iphone_canvas_h"],
+                                             cfg["iphone_image_scale"])
         except Exception as e:
-            log(f"Download failed for block {bid}: {e}")
-            dest.unlink(missing_ok=True)
-
-    state["downloaded_ids"] = sorted(seen)
-    save_state(state)
-    log(f"Sync complete. New images: {new_count}")
-
-    # Generate iPhone wallpapers for any image not yet processed
-    for img in list_local_images(cfg["image_dir"]):
-        iphone_out = cfg["iphone_image_dir"] / (img.stem + ".jpg")
-        if not iphone_out.exists():
-            prepare_iphone_wallpaper(img, cfg["iphone_image_dir"],
-                                     cfg["iphone_canvas_w"], cfg["iphone_canvas_h"],
-                                     cfg["iphone_image_scale"])
+            log(f"iPhone wallpaper generation error ({e}); continuing.")
 
     # Set wallpapers with no-repeat
     imgs = list_local_images(cfg["image_dir"])
@@ -388,7 +434,11 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "--batch-iphone":
         cfg = load_config()
-        ensure_dirs(cfg["image_dir"], cfg["iphone_image_dir"], CACHE_DIR)
+        ensure_dirs(cfg["image_dir"], CACHE_DIR)
+        iphone_error = iphone_dir_usable(cfg["iphone_image_dir"])
+        if iphone_error:
+            print(f"Cannot batch iPhone wallpapers: {iphone_error}", file=sys.stderr)
+            sys.exit(2)
         imgs = list_local_images(cfg["image_dir"])
         total = len(imgs)
         processed = 0
