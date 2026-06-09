@@ -551,14 +551,14 @@ def sync_and_set():
     # (so the extra RunAtLoad runs on login don't spam you).
     if errors:
         body = "\n".join(errors + warnings) + f"\n(new images: {new_count}, screens set: {set_ok})"
-        notify(cfg, "arena-wallpaper: problem", body, priority="high", tags="warning")
+        notify(cfg, "arena-wallpaper: problem", body, priority="high")
     else:
         today = today_str()
         if state.get("last_summary_date") != today:
             summary = f"Wallpaper updated on {set_ok} screen(s), {new_count} new image(s)."
             if warnings:
                 summary += "\n" + "\n".join(warnings)
-            notify(cfg, "arena-wallpaper: daily summary", summary, priority="low", tags="frame_photo")
+            notify(cfg, "arena-wallpaper: daily summary", summary, priority="low")
             state["last_summary_date"] = today
             save_state(state)
 
