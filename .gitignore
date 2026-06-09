@@ -7,8 +7,9 @@ images-iphone/
 .cache/
 
 # Runtime state
-.state.json
+.state.json*
 *.log
+*.log.*
 
 # Python
 .venv/

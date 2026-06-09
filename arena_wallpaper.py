@@ -19,8 +19,15 @@ def _expand(p: str) -> str:
     return os.path.expanduser(os.path.expandvars(p))
 
 
+_LOG_MAX_BYTES = 1_000_000  # rotate arena_wallpaper.log past ~1 MB (keep one .1 backup)
+
 def log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > _LOG_MAX_BYTES:
+            LOG_PATH.replace(LOG_PATH.with_name(LOG_PATH.name + ".1"))
+    except OSError:
+        pass
     with LOG_PATH.open("a") as f:
         f.write(f"[{ts}] {msg}\n")
 
@@ -29,14 +36,14 @@ _PLACEHOLDERS = {"", "your_personal_access_token_here", "your-channel-slug"}
 
 
 def load_config():
-    load_dotenv(ENV_PATH)
+    load_dotenv(ENV_PATH, override=True)
     token = os.getenv("ARENA_ACCESS_TOKEN", "").strip()
     slug = os.getenv("ARENA_BOARD_SLUG", "").strip()
     image_dir_env = os.getenv("IMAGE_DIR", "").strip()
     image_dir = Path(_expand(image_dir_env)) if image_dir_env else IMG_DIR
     scale = os.getenv("WALLPAPER_SCALE", "center").strip()
     per_screen_random = os.getenv("PER_SCREEN_RANDOM", "true").lower() == "true"
-    target_w = int(os.getenv("TARGET_WIDTH", "480") or "0")
+    target_w = int(os.getenv("TARGET_WIDTH", "720") or "0")
     recent_days = int(os.getenv("RECENT_DAYS", "7") or "0")
     iphone_dir_env = os.getenv("IPHONE_IMAGE_DIR", "").strip()
     iphone_image_dir = Path(_expand(iphone_dir_env)) if iphone_dir_env else (ROOT / "images-iphone")
@@ -92,27 +99,38 @@ def load_state() -> dict:
     return {}
 
 def save_state(state: dict):
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    # Atomic write: a kill mid-write must never corrupt state (a truncated file would
+    # force a full re-download and wipe the no-repeat history).
+    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_PATH)
 
 # --- Are.na via curl (avoids Cloudflare issues) ---
-def curl_json(url: str, token: Optional[str]=None) -> dict:
-    cmd = ["curl", "-sS", "-A", UA, "-H", "Accept: application/json"]
+def _curl_json_once(url: str, token: Optional[str]) -> dict:
+    cmd = ["curl", "-sS", "--connect-timeout", "15", "--max-time", "120",
+           "-A", UA, "-H", "Accept: application/json"]
     if token:
+        # Token stays in the Authorization header — never placed in the URL.
         cmd += ["-H", f"Authorization: Bearer {token}"]
     cmd += [url]
+    out = subprocess.check_output(cmd, text=True)
+    head = out.lstrip().lower()
+    if head.startswith("<!doctype html") or head.startswith("<html"):
+        raise RuntimeError(f"HTML received from Are.na (Cloudflare/403): {out[:200].strip()}")
+    return json.loads(out)
+
+def curl_json(url: str, token: Optional[str]=None) -> dict:
+    # One retry for transient failures (network blip, timeout, brief 403). The retry
+    # uses the same header-based request — the token is never moved into the URL.
     try:
-        out = subprocess.check_output(cmd, text=True)
-        if out.startswith("<!DOCTYPE html>"):
-            raise subprocess.CalledProcessError(22, cmd, output=out)
-        return json.loads(out)
-    except Exception:
-        sep = "&" if "?" in url else "?"
-        url2 = f"{url}{sep}access_token={token or ''}"
-        out2 = subprocess.check_output(["curl", "-sS", "-A", UA, "-H", "Accept: application/json", url2], text=True)
-        if out2.startswith("<!DOCTYPE html>"):
-            snippet = out2[:300].replace("\n"," ")
-            raise RuntimeError(f"Cloudflare/403 HTML received from Are.na: {snippet}")
-        return json.loads(out2)
+        return _curl_json_once(url, token)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, RuntimeError) as e:
+        log(f"Are.na request failed ({e}); retrying once.")
+        return _curl_json_once(url, token)
 
 def arena_iter_blocks(token: str, slug: str):
     page, per = 1, 100
@@ -150,7 +168,8 @@ def filename_from(block_id: int, filename: str) -> str:
     return f"{block_id}__{base}"
 
 def download_image(url: str, dest: Path) -> bool:
-    cmd = ["curl", "-fL", "-A", UA, "-o", str(dest), url]
+    cmd = ["curl", "-fsSL", "--connect-timeout", "15", "--max-time", "120",
+           "-A", UA, "-o", str(dest), url]
     subprocess.check_call(cmd)
     return True
 
@@ -188,7 +207,32 @@ def list_local_images(image_dir: Path) -> List[Path]:
     exts = {".jpg", ".jpeg", ".png", ".heic", ".tiff", ".gif", ".bmp", ".webp"}
     return sorted([p for p in image_dir.glob("*") if p.suffix.lower() in exts])
 
-# Prepare centered 480px-wide temp copy; original untouched
+_BID_PREFIX = re.compile(r"^(\d+)__")
+
+def prune_removed(image_dir: Path, cache_dir: Path, iphone_dir: Path, current_ids: set) -> int:
+    """Delete local files whose Are.na block id is no longer present on the channel.
+
+    Only ever touches files named '<digits>__...' (the convention from filename_from),
+    so unrelated files are never at risk. The caller must invoke this only after a
+    clean, complete sync with a non-empty current_ids set.
+    """
+    removed = 0
+    for d in (image_dir, cache_dir, iphone_dir):
+        if not d or not d.exists():
+            continue
+        for f in d.glob("*"):
+            if not f.is_file():
+                continue
+            m = _BID_PREFIX.match(f.name)
+            if m and int(m.group(1)) not in current_ids:
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+# Prepare a centered, width-capped display copy (TARGET_WIDTH); original untouched
 def prepare_for_wallpaper(img: Path, target_w: int) -> Path:
     if target_w <= 0:
         return img
@@ -375,15 +419,23 @@ def sync_and_set():
     state = load_state()
     seen = set(state.get("downloaded_ids", []))
     new_count = 0
+    current_ids: set = set()
+    total_blocks = image_blocks = 0
+    sync_ok = False
 
     # Download ALL images. A network failure at boot (the LaunchAgent can fire before
     # the network is up) must not stop the wallpaper rotating off existing local images.
     try:
         for block in arena_iter_blocks(cfg["token"], cfg["slug"]):
+            total_blocks += 1
             if not is_image_block(block):
                 continue
+            image_blocks += 1
             bid = block.get("id")
-            if not bid or bid in seen:
+            if not bid:
+                continue
+            current_ids.add(bid)
+            if bid in seen:
                 continue
             chosen = pick_image_url(block)
             if not chosen:
@@ -398,11 +450,29 @@ def sync_and_set():
             except Exception as e:
                 log(f"Download failed for block {bid}: {e}")
                 dest.unlink(missing_ok=True)
+        sync_ok = True
+        if total_blocks and image_blocks == 0:
+            log(f"Warning: channel returned {total_blocks} blocks but 0 image blocks — "
+                f"Are.na may have changed its API shape (expected type == 'Image').")
+        # Forget ids no longer present on the channel.
+        if current_ids:
+            seen &= current_ids
         state["downloaded_ids"] = sorted(seen)
         save_state(state)
         log(f"Sync complete. New images: {new_count}")
     except Exception as e:
         log(f"Are.na sync skipped ({e}); using existing local images.")
+
+    # Prune local files for blocks removed from the channel — only after a clean,
+    # complete sync that actually returned images, so a transient empty response can
+    # never wipe the whole library.
+    if sync_ok and current_ids:
+        try:
+            n = prune_removed(cfg["image_dir"], CACHE_DIR, cfg["iphone_image_dir"], current_ids)
+            if n:
+                log(f"Pruned {n} file(s) for blocks no longer on the channel.")
+        except Exception as e:
+            log(f"Prune skipped ({e}).")
 
     # Generate iPhone wallpapers for any image not yet processed (optional feature).
     if iphone_enabled:
