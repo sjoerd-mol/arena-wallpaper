@@ -175,6 +175,7 @@ All settings live in `.env`. See `.env.example` for full descriptions. Key optio
 | Setting | Default | What it does |
 |---|---|---|
 | `WALLPAPER_SCALE` | `center` | How the image is displayed. `center` = actual size, no scaling. Also: `fill`, `fit`, `stretch`. |
+| `WALLPAPER_FILL_COLOR` | (empty) | Background color around the image, as `#RRGGBB`. Empty keeps each screen's current color. Set it if the color sometimes resets to blue (macOS stores it per Space and per display). |
 | `TARGET_WIDTH` | `720` | Width in pixels of the cached copy used for display. Originals are never modified. Images narrower than this are never upscaled. |
 | `PER_SCREEN_RANDOM` | `true` | Pick a different image per connected screen. |
 | `RECENT_DAYS` | `7` | Number of days to avoid repeating the same image. |

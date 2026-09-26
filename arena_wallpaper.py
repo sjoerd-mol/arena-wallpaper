@@ -35,6 +35,38 @@ def log(msg: str):
 _PLACEHOLDERS = {"", "your_personal_access_token_here", "your-channel-slug"}
 
 
+def _env_number(name: str, default, cast=int, if_empty=None):
+    """Read a numeric setting; a typo (e.g. '720px') falls back to the default
+    instead of crashing the unattended run. `if_empty` is used when the variable is
+    set but blank (e.g. 'TARGET_WIDTH=' means 0, i.e. off)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default if if_empty is None else if_empty
+    try:
+        return cast(raw)
+    except ValueError:
+        msg = f"{name}={raw!r} is not a valid number; using default {default}."
+        log(f"Config warning: {msg}")
+        print(f"Config warning: {msg}", file=sys.stderr)
+        return default
+
+
+def _parse_hex_color(raw: str) -> Optional[Tuple[float, float, float]]:
+    """'#4A7061' or '4A7061' -> (r, g, b) in 0..1; None if empty or invalid."""
+    s = raw.strip().lstrip("#")
+    if not s:
+        return None
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", s):
+        msg = f"WALLPAPER_FILL_COLOR={raw!r} is not a #RRGGBB hex color; ignoring it."
+        log(f"Config warning: {msg}")
+        print(f"Config warning: {msg}", file=sys.stderr)
+        return None
+    return tuple(int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
 def load_config():
     load_dotenv(ENV_PATH, override=True)
     token = os.getenv("ARENA_ACCESS_TOKEN", "").strip()
@@ -42,14 +74,15 @@ def load_config():
     image_dir_env = os.getenv("IMAGE_DIR", "").strip()
     image_dir = Path(_expand(image_dir_env)) if image_dir_env else IMG_DIR
     scale = os.getenv("WALLPAPER_SCALE", "center").strip()
+    fill_color = _parse_hex_color(os.getenv("WALLPAPER_FILL_COLOR", ""))
     per_screen_random = os.getenv("PER_SCREEN_RANDOM", "true").lower() == "true"
-    target_w = int(os.getenv("TARGET_WIDTH", "720") or "0")
-    recent_days = int(os.getenv("RECENT_DAYS", "7") or "0")
+    target_w = _env_number("TARGET_WIDTH", 720, if_empty=0)
+    recent_days = _env_number("RECENT_DAYS", 7, if_empty=0)
     iphone_dir_env = os.getenv("IPHONE_IMAGE_DIR", "").strip()
     iphone_image_dir = Path(_expand(iphone_dir_env)) if iphone_dir_env else (ROOT / "images-iphone")
-    iphone_canvas_w = int(os.getenv("IPHONE_CANVAS_W", "1206") or "1206")
-    iphone_canvas_h = int(os.getenv("IPHONE_CANVAS_H", "2622") or "2622")
-    iphone_image_scale = float(os.getenv("IPHONE_IMAGE_SCALE", "0.75") or "0.75")
+    iphone_canvas_w = _env_number("IPHONE_CANVAS_W", 1206)
+    iphone_canvas_h = _env_number("IPHONE_CANVAS_H", 2622)
+    iphone_image_scale = _env_number("IPHONE_IMAGE_SCALE", 0.75, float)
     ntfy_url = os.getenv("NTFY_URL", "").strip()
     ntfy_token = os.getenv("NTFY_TOKEN", "").strip()
     problems = []
@@ -63,7 +96,7 @@ def load_config():
         sys.exit(2)
     return {
         "token": token, "slug": slug, "image_dir": image_dir,
-        "scale": scale, "per_screen_random": per_screen_random,
+        "scale": scale, "fill_color": fill_color, "per_screen_random": per_screen_random,
         "target_w": target_w, "recent_days": recent_days,
         "iphone_image_dir": iphone_image_dir, "iphone_canvas_w": iphone_canvas_w,
         "iphone_canvas_h": iphone_canvas_h, "iphone_image_scale": iphone_image_scale,
@@ -135,6 +168,17 @@ def notify(cfg: dict, title: str, message: str, priority: str = "default", tags:
         log(f"ntfy notification failed: {e}")
 
 # --- Are.na via curl (avoids Cloudflare issues) ---
+class ArenaAPIError(RuntimeError):
+    """Are.na answered, but with an error (bad token, unknown channel, ...).
+
+    Without -f, curl exits 0 on a 401/404 and prints a JSON error body. That body has
+    no 'data' list, and used to look exactly like an empty channel: the run reported
+    'Sync complete' and nobody noticed the token or slug was wrong.
+    """
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
 def _curl_json_once(url: str, token: Optional[str]) -> dict:
     cmd = ["curl", "-sS", "--connect-timeout", "15", "--max-time", "120",
            "-A", UA, "-H", "Accept: application/json"]
@@ -146,31 +190,59 @@ def _curl_json_once(url: str, token: Optional[str]) -> dict:
     head = out.lstrip().lower()
     if head.startswith("<!doctype html") or head.startswith("<html"):
         raise RuntimeError(f"HTML received from Are.na (Cloudflare/403): {out[:200].strip()}")
-    return json.loads(out)
+    data = json.loads(out)
+    if not isinstance(data, dict) or "error" in data or not isinstance(data.get("data"), list):
+        err = data if isinstance(data, dict) else {}
+        code = err.get("code") if isinstance(err.get("code"), int) else None
+        detail = (err.get("details") or {}).get("message") if isinstance(err.get("details"), dict) else None
+        msg = err.get("error") or "unexpected response (no 'data' list)"
+        raise ArenaAPIError(f"Are.na API error{f' {code}' if code else ''}: {msg}"
+                            f"{f' ({detail})' if detail else ''}", code)
+    return data
 
 def curl_json(url: str, token: Optional[str]=None) -> dict:
     # One retry for transient failures (network blip, timeout, brief 403). The retry
     # uses the same header-based request — the token is never moved into the URL.
     try:
         return _curl_json_once(url, token)
+    except ArenaAPIError as e:
+        if e.code in (401, 403, 404):
+            raise  # wrong token or slug: retrying won't help
+        log(f"Are.na request failed ({e}); retrying once.")
+        return _curl_json_once(url, token)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
             json.JSONDecodeError, RuntimeError) as e:
         log(f"Are.na request failed ({e}); retrying once.")
         return _curl_json_once(url, token)
 
-def arena_iter_blocks(token: str, slug: str):
+def arena_iter_blocks(token: str, slug: str, report: Optional[dict] = None):
+    """Yield every block of the channel, page by page.
+
+    If `report` is given, it is filled in: 'complete' is True only when paging ended
+    normally and the number of blocks matches the API's total_count. The prune step
+    relies on this, so a page that comes back short can never delete local images.
+    """
     page, per = 1, 100
+    seen = 0
+    total_count = None
+    complete = False
     while True:
         data = curl_json(f"https://api.are.na/v3/channels/{slug}/contents?per={per}&page={page}", token)
-        blocks = data.get("data") or []
-        if not blocks:
-            break
-        for block in blocks:
-            yield block
         meta = data.get("meta") or {}
+        if total_count is None and isinstance(meta.get("total_count"), int):
+            total_count = meta["total_count"]
+        blocks = data.get("data") or []
+        for block in blocks:
+            seen += 1
+            yield block
         if not meta.get("has_more_pages", False):
+            complete = total_count is None or seen == total_count
             break
+        if not blocks:
+            break  # API claims more pages but sent none: treat as incomplete
         page += 1
+    if report is not None:
+        report.update(complete=complete, seen=seen, total_count=total_count)
 
 def is_image_block(block: dict) -> bool:
     return block.get("type") == "Image" and isinstance(block.get("image"), dict)
@@ -189,8 +261,18 @@ def pick_image_url(block: dict) -> Optional[Tuple[str, str]]:
         return medium["src"], fname
     return None
 
-def filename_from(block_id: int, filename: str) -> str:
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".tiff", ".gif", ".bmp", ".webp"}
+_EXT_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "image/heic": ".heic", "image/tiff": ".tiff", "image/bmp": ".bmp",
+}
+
+def filename_from(block_id: int, filename: str, content_type: str = "") -> str:
     base = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+    # Without a known image extension, list_local_images would never see the file,
+    # while its id is still marked as downloaded: it would be silently lost.
+    if Path(base).suffix.lower() not in IMAGE_EXTS:
+        base += _EXT_BY_CONTENT_TYPE.get((content_type or "").lower(), ".jpg")
     return f"{block_id}__{base}"
 
 def download_image(url: str, dest: Path) -> bool:
@@ -230,19 +312,27 @@ def normalize_image(path: Path) -> Path:
     return path
 
 def list_local_images(image_dir: Path) -> List[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".heic", ".tiff", ".gif", ".bmp", ".webp"}
-    return sorted([p for p in image_dir.glob("*") if p.suffix.lower() in exts])
+    return sorted([p for p in image_dir.glob("*") if p.suffix.lower() in IMAGE_EXTS])
 
 _BID_PREFIX = re.compile(r"^(\d+)__")
 
-def prune_removed(image_dir: Path, cache_dir: Path, iphone_dir: Path, current_ids: set) -> int:
+class PruneRefused(RuntimeError):
+    pass
+
+def prune_removed(image_dir: Path, cache_dir: Path, iphone_dir: Path, current_ids: set,
+                  max_share: float = 0.25) -> int:
     """Delete local files whose Are.na block id is no longer present on the channel.
 
     Only ever touches files named '<digits>__...' (the convention from filename_from),
     so unrelated files are never at risk. The caller must invoke this only after a
     clean, complete sync with a non-empty current_ids set.
+
+    As a last safety net, refuses (PruneRefused) when more than `max_share` of the
+    local originals would go at once (with a floor of 5 files): that looks like a bad
+    API response, not a curator removing a few blocks.
     """
-    removed = 0
+    doomed: List[Path] = []
+    doomed_originals = originals = 0
     for d in (image_dir, cache_dir, iphone_dir):
         if not d or not d.exists():
             continue
@@ -250,12 +340,24 @@ def prune_removed(image_dir: Path, cache_dir: Path, iphone_dir: Path, current_id
             if not f.is_file():
                 continue
             m = _BID_PREFIX.match(f.name)
-            if m and int(m.group(1)) not in current_ids:
-                try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            if not m:
+                continue
+            if d is image_dir:
+                originals += 1
+            if int(m.group(1)) not in current_ids:
+                doomed.append(f)
+                if d is image_dir:
+                    doomed_originals += 1
+    if doomed_originals > max(5, int(originals * max_share)):
+        raise PruneRefused(f"would delete {doomed_originals} of {originals} local images; "
+                           f"skipped as a safety measure")
+    removed = 0
+    for f in doomed:
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
     return removed
 
 # Prepare a centered, width-capped display copy (TARGET_WIDTH); original untouched
@@ -339,11 +441,36 @@ def wallpaper_screens() -> List[str]:
     return [str(i) for i in range(len(screens))]
 
 
-def set_wallpaper_for_screen(img: Path, screen: str, scale: str):
-    from AppKit import NSWorkspace, NSScreen
+def _color_to_rgba(color) -> Optional[List[float]]:
+    from AppKit import NSColorSpace
+    try:
+        c = color.colorUsingColorSpace_(NSColorSpace.genericRGBColorSpace())
+        return [c.redComponent(), c.greenComponent(), c.blueComponent(), c.alphaComponent()]
+    except Exception:
+        return None
+
+
+def set_wallpaper_for_screen(img: Path, screen: str, scale: str,
+                             fill_color: Optional[Tuple[float, float, float]] = None,
+                             known_colors: Optional[Dict[str, List[float]]] = None):
+    """Set `img` on one screen (index as string) or on "all".
+
+    Fill color, in order of preference:
+      1. `fill_color` (WALLPAPER_FILL_COLOR in .env);
+      2. the color macOS reports for the screen right now (kept as-is);
+      3. the last color seen for this display in an earlier run (`known_colors`,
+         keyed by display name, persisted in .state.json).
+    macOS keeps the color per Space and per display, and does not always report it:
+    for a few seconds after a change, and apparently for a Space/display pair it has
+    not stored yet. Passing no color makes macOS fall back to its default blue.
+    """
+    from AppKit import NSWorkspace, NSScreen, NSColor, NSWorkspaceDesktopImageFillColorKey
     from Foundation import NSURL
 
-    options = _scale_options(scale)
+    options = dict(_scale_options(scale))
+    if fill_color:
+        options[NSWorkspaceDesktopImageFillColorKey] = \
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(*fill_color, 1.0)
     url = NSURL.fileURLWithPath_(str(img.resolve()))
     workspace = NSWorkspace.sharedWorkspace()
     all_screens = NSScreen.screens()
@@ -359,9 +486,25 @@ def set_wallpaper_for_screen(img: Path, screen: str, scale: str):
 
     ok = True
     for idx, ns_screen in targets:
+        name = str(ns_screen.localizedName())
         # Preserve existing options (e.g. fill color) so user-set background color survives
         current = workspace.desktopImageOptionsForScreen_(ns_screen)
         merged = dict(current) if current else {}
+        reported = merged.get(NSWorkspaceDesktopImageFillColorKey)
+        if reported is not None and known_colors is not None:
+            rgba = _color_to_rgba(reported)
+            if rgba:
+                known_colors[name] = rgba
+        elif reported is None and not fill_color:
+            remembered = (known_colors or {}).get(name)
+            if remembered:
+                merged[NSWorkspaceDesktopImageFillColorKey] = \
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(*remembered)
+                log(f"Screen {idx} ({name}): macOS reported no fill color; "
+                    f"reusing the last known one.")
+            else:
+                log(f"Screen {idx} ({name}): macOS reported no fill color, so it will fall "
+                    f"back to its default. Set WALLPAPER_FILL_COLOR in .env to pin a color.")
         merged.update(options)
         success, error = workspace.setDesktopImageURL_forScreen_options_error_(
             url, ns_screen, merged, None
@@ -404,7 +547,8 @@ def choose_nonrecent(images: List[Path], excluded: set) -> Optional[Path]:
     pool = [p for p in images if p.name not in excluded]
     return random.choice(pool if pool else images) if images else None
 
-def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: dict, recent_days: int):
+def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: dict, recent_days: int,
+                          fill_color: Optional[Tuple[float, float, float]] = None):
     screens = wallpaper_screens()
     recent = build_recent_sets(state, recent_days)
 
@@ -429,7 +573,8 @@ def set_random_per_screen(images: List[Path], scale: str, target_w: int, state: 
             pick = random.choice(shuffled)
 
         prepared = prepare_for_wallpaper(pick, target_w)
-        if set_wallpaper_for_screen(prepared, screen, scale):
+        if set_wallpaper_for_screen(prepared, screen, scale, fill_color,
+                                    state.setdefault("fill_colors", {})):
             set_ok += 1
         else:
             set_fail += 1
@@ -456,13 +601,14 @@ def sync_and_set():
     current_ids: set = set()
     total_blocks = image_blocks = 0
     sync_ok = False
+    paging: dict = {}
     warnings: list = []   # soft issues — reported quietly in the daily summary
     errors: list = []     # hard failures — trigger a high-priority alert
 
     # Download ALL images. A network failure at boot (the LaunchAgent can fire before
     # the network is up) must not stop the wallpaper rotating off existing local images.
     try:
-        for block in arena_iter_blocks(cfg["token"], cfg["slug"]):
+        for block in arena_iter_blocks(cfg["token"], cfg["slug"], paging):
             total_blocks += 1
             if not is_image_block(block):
                 continue
@@ -477,7 +623,8 @@ def sync_and_set():
             if not chosen:
                 continue
             url, fname = chosen
-            dest = cfg["image_dir"] / filename_from(bid, fname)
+            content_type = (block.get("image") or {}).get("content_type", "")
+            dest = cfg["image_dir"] / filename_from(bid, fname, content_type)
             try:
                 download_image(url, dest)
                 dest = normalize_image(dest)
@@ -498,6 +645,10 @@ def sync_and_set():
         state["downloaded_ids"] = sorted(seen)
         save_state(state)
         log(f"Sync complete. New images: {new_count}")
+    except ArenaAPIError as e:
+        # Wrong token or slug: the agent keeps rotating old images forever unless told.
+        log(f"Are.na sync failed: {e}")
+        errors.append(f"{e}. Check ARENA_ACCESS_TOKEN and ARENA_BOARD_SLUG in .env.")
     except Exception as e:
         log(f"Are.na sync skipped ({e}); using existing local images.")
         warnings.append(f"Are.na sync skipped ({type(e).__name__}); used existing images.")
@@ -505,11 +656,19 @@ def sync_and_set():
     # Prune local files for blocks removed from the channel — only after a clean,
     # complete sync that actually returned images, so a transient empty response can
     # never wipe the whole library.
-    if sync_ok and current_ids:
+    if sync_ok and current_ids and not paging.get("complete"):
+        msg = (f"Prune skipped: channel listing looks incomplete "
+               f"({paging.get('seen')} of {paging.get('total_count')} blocks received).")
+        log(msg)
+        warnings.append(msg)
+    elif sync_ok and current_ids:
         try:
             n = prune_removed(cfg["image_dir"], CACHE_DIR, cfg["iphone_image_dir"], current_ids)
             if n:
                 log(f"Pruned {n} file(s) for blocks no longer on the channel.")
+        except PruneRefused as e:
+            log(f"Prune skipped: {e}.")
+            warnings.append(f"Prune skipped: {e}.")
         except Exception as e:
             log(f"Prune skipped ({e}).")
 
@@ -531,11 +690,14 @@ def sync_and_set():
     if not imgs:
         errors.append("No local images available to set as wallpaper.")
     elif cfg["per_screen_random"]:
-        set_ok, set_fail = set_random_per_screen(imgs, cfg["scale"], cfg["target_w"], state, cfg["recent_days"])
+        set_ok, set_fail = set_random_per_screen(imgs, cfg["scale"], cfg["target_w"], state,
+                                                 cfg["recent_days"], cfg["fill_color"])
     else:
-        picked = choose_nonrecent(imgs, set())
+        recent_all = build_recent_sets(state, cfg["recent_days"]).get("all", set())
+        picked = choose_nonrecent(imgs, recent_all)
         prepared = prepare_for_wallpaper(picked, cfg["target_w"])
-        if set_wallpaper_for_screen(prepared, "all", cfg["scale"]):
+        if set_wallpaper_for_screen(prepared, "all", cfg["scale"], cfg["fill_color"],
+                                    state.setdefault("fill_colors", {})):
             set_ok = 1
         else:
             set_fail = 1
@@ -589,18 +751,23 @@ if __name__ == "__main__":
         print(f"Dry run — fetching blocks from Are.na channel: {cfg['slug']}")
         count = 0
         image_count = 0
-        for block in arena_iter_blocks(cfg["token"], cfg["slug"]):
-            count += 1
-            bid = block.get("id")
-            cls = block.get("class")
-            if is_image_block(block):
-                image_count += 1
-                chosen = pick_image_url(block)
-                url, fname = chosen if chosen else ("(no url)", "(no filename)")
-                print(f"  [{count}] Image block id={bid} file={fname} url={url}")
-            else:
-                print(f"  [{count}] Non-image block id={bid} class={cls}")
-        print(f"\nTotal blocks: {count}  Image blocks: {image_count}")
+        paging: dict = {}
+        try:
+            for block in arena_iter_blocks(cfg["token"], cfg["slug"], paging):
+                count += 1
+                bid = block.get("id")
+                if is_image_block(block):
+                    image_count += 1
+                    chosen = pick_image_url(block)
+                    url, fname = chosen if chosen else ("(no url)", "(no filename)")
+                    print(f"  [{count}] Image block id={bid} file={fname} url={url}")
+                else:
+                    print(f"  [{count}] Non-image block id={bid} type={block.get('type')}")
+        except ArenaAPIError as e:
+            print(f"{e}. Check ARENA_ACCESS_TOKEN and ARENA_BOARD_SLUG in .env.", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nTotal blocks: {count}  Image blocks: {image_count}  "
+              f"(API total_count: {paging.get('total_count')}, complete: {paging.get('complete')})")
         print("Dry run complete — no files written.")
     else:
         sync_and_set()
